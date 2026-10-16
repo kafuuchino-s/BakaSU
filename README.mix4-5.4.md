@@ -10,9 +10,6 @@ git clone --branch mix4-5.4 https://github.com/kafuuchino-s/BakaSU.git
 git -C BakaSU remote add upstream https://github.com/Baka-SU/BakaSU.git
 ```
 
-The fork URL is the intended publication location. Until published, clone the
-local repository supplied by the integration owner and select its fixed commit.
-
 Use this repository as the `BakaSU` submodule of
 [`kernel_xiaomi_odin`](https://github.com/kafuuchino-s/kernel_xiaomi_odin).
 Keep `drivers/kernelsu` pointing to `BakaSU/kernel`. The parent kernel owns the
@@ -46,8 +43,9 @@ existing kernel. The fork commit identifies source revisions independently.
 
 ## Updating the port
 
-Choose and record an exact upstream commit, then rebase the 5.4 glue and update
-`kernel/mix4-build-identity.mk` deliberately. Review the numeric version, tag,
+Choose and record an exact upstream commit, merge it into `mix4-5.4`, and resolve
+the Linux 5.4 interface differences in the maintained branch. Update
+`kernel/mix4-build-identity.mk` explicitly. Review the numeric version, tag,
 commit label, and branch placeholder together; a new pin can change kernel bytes.
 Keep format selection in the parent kernel configuration.
 
