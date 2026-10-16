@@ -22,7 +22,6 @@
 #ifdef CONFIG_KSU_SUSFS
 #include <linux/susfs_def.h>
 #include <linux/namei.h>
-#include "selinux/selinux.h"
 #include "objsec.h"
 #endif // #ifdef CONFIG_KSU_SUSFS
 
@@ -31,6 +30,7 @@
 #include "policy/feature.h"
 #include "klog.h" // IWYU pragma: keep
 #include "runtime/ksud.h"
+#include "selinux/selinux.h"
 #include "feature/sucompat.h"
 #include "policy/app_profile.h"
 #include "supercall/supercall.h"
@@ -393,7 +393,7 @@ static inline int do_ksu_handle_execveat_sucompat(int *fd, const char *filename,
 // fd, filename, argv, envp, flags and retval were NOT provided in bprm_committed_creds (KSU_COMPAT_NO_POST_EXECVE_HOOK)!
 int ksu_handle_post_execve(int *fd, const char *filename, void *argv, void *envp, int *flags, int *retval)
 {
-    if (likely(!test_thread_flag(TIF_PROC_IN_KSU_EXECVE))) {
+    if (likely(!test_and_clear_thread_flag(TIF_PROC_IN_KSU_EXECVE))) {
         return -EINVAL;
     }
 #ifndef KSU_COMPAT_HAS_SUSFS_INSTALL_SU_FD_DIRECT_CALL
@@ -437,6 +437,7 @@ static inline void ksu_handle_execveat_init(const char *filename, void *envp)
 int ksu_handle_execve(int *fd, const char *filename, void *argv, void *envp, int *flags)
 {
     struct ksu_sulog_pending_event *pending_root_execve = NULL;
+    clear_thread_flag(TIF_PROC_IN_KSU_EXECVE);
 
 #ifndef CONFIG_KSU_TRACEPOINT_HOOK
     if (ksu_is_current_proc_unprivillege()) {

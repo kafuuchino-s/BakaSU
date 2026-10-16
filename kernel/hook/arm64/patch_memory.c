@@ -286,7 +286,7 @@ static int ksu_patch_text_nosync(void *dst, void *src, size_t len, int flags)
     }
     pr_info("phy addr for patch 0x%lx: 0x%lx\n", p, phy);
 
-    void *map = set_fixmap_offset(FIX_TEXT_POKE0, phy);
+    void *map = (void *)set_fixmap_offset(FIX_TEXT_POKE0, phy);
     pr_info("fixmap addr for patch 0x%lx: 0x%lx\n", p, (unsigned long)map);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)

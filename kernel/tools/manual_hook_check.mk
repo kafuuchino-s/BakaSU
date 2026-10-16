@@ -73,8 +73,7 @@ endif
 
 $(eval $(call check_ksu_hook,ksu_handle_faccessat,$(srctree)/fs/open.c))
 $(eval $(call check_ksu_hook,ksu_handle_stat,$(srctree)/fs/stat.c))
-$(eval $(call check_ksu_hook,ksu_handle_newfstat_ret,$(srctree)/fs/stat.c))
-$(eval $(call check_ksu_hook,ksu_handle_fstat64_ret,$(srctree)/fs/stat.c))
+$(eval $(call check_ksu_hook,ksu_handle_vfs_fstat,$(srctree)/fs/stat.c))
 
 ifeq ($(shell test \( $(VERSION) -lt 3 -o \( $(VERSION) -eq 3 -a $(PATCHLEVEL) -le 11 \) \) && echo y),y)
   # https://github.com/torvalds/linux/commit/15d94b82565ebfb0cf27830b96e6cf5ed2d12a9a

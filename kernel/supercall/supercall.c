@@ -143,7 +143,7 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user 
     // other sys_reboot extensions are fully require uid 0,
     // so let's check it before
     if (ksu_get_uid_t(current_uid()) != 0)
-        return 0;
+        return -EPERM;
 
 #ifdef CONFIG_KSU_TOOLKIT_SUPPORT
     if (ksu_try_handle_toolkit_cmd(magic2, cmd, arg))

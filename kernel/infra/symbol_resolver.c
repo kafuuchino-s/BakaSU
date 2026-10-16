@@ -26,7 +26,12 @@ static const size_t cfi_suffix_len = sizeof(cfi_suffix) - 1;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
 #define ALWAYS_HAVE_ON_EACH_SYMBOL 1
 #else
+#if !defined(MODULE) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+/* Builtin 5.4 has the declared callback API: keep typed CFI calls. */
+#define ALWAYS_HAVE_ON_EACH_SYMBOL 1
+#else
 #define ALWAYS_HAVE_ON_EACH_SYMBOL 0
+#endif
 #endif
 
 #if !ALWAYS_HAVE_ON_EACH_SYMBOL
@@ -56,7 +61,7 @@ struct ksu_lookup_symbol_ctx {
     void *match;
 };
 
-unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
+unsigned long find_kernel_symbol_exact(const char *symbol_name)
 {
     unsigned long addr = 0;
 #if HAVE_ON_EACH_MATCH_SYMBOL
@@ -122,7 +127,7 @@ static int lookup_symbol_variant_cb(void *data, const char *name, struct module 
     return 0;
 }
 
-static __nocfi void *resolve_symbol_variant(const char *symbol_name, size_t symbol_len)
+static void *resolve_symbol_variant(const char *symbol_name, size_t symbol_len)
 {
     struct ksu_lookup_symbol_ctx ctx = {
         .symbol_name = symbol_name,

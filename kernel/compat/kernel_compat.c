@@ -92,8 +92,8 @@ __weak int path_mount(const char *dev_name, struct path *path, const char *type_
     // -1 on the size as implicit null termination
     // as we zero init the thing
     char *realpath = d_path(path, buf, sizeof(buf) - 1);
-    if (!(realpath && realpath != buf))
-        return -ENOENT;
+    if (IS_ERR(realpath))
+        return PTR_ERR(realpath);
 
     old_fs = get_fs();
     set_fs(KERNEL_DS);

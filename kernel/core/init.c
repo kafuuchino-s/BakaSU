@@ -306,6 +306,10 @@ void __exit kernelsu_exit(void)
     if (!ksu_late_loaded)
         ksu_ksud_exit();
 
+#ifdef CONFIG_KSU_SUSFS
+    susfs_shutdown();
+#endif
+
     // Wait for any in-flight RCU readers (e.g. handler traversing allow_list)
     synchronize_rcu();
 

@@ -13,6 +13,8 @@
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
 #include <linux/namei.h>
+#include <linux/mount.h>
+#include "selinux/selinux.h"
 
 #include "policy/app_profile.h"
 #include "policy/allowlist.h"

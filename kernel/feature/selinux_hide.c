@@ -444,7 +444,7 @@ extern setprocattr_fn ksu_orig_setprocattr;
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0) || defined(KSU_COMPAT_SETPROCATTR_USE_NEW_PROTOTYPE)
-int __nocfi ksu_handle_selinux_setprocattr(const char *name, void *value, size_t size)
+int ksu_handle_selinux_setprocattr(const char *name, void *value, size_t size)
 #else
 int __nocfi ksu_handle_selinux_setprocattr(struct task_struct *p, char *name, void *value, size_t size)
 #endif
@@ -1283,15 +1283,24 @@ static int ksu_security_context_to_sid(struct policydb *orig_policydb, struct si
     rc = string_to_context_struct(policydb, orig_policydb, sidtab, orig_sidtab, scontext2, scontext3, scontext_len,
                                   &context, &orig_context, def_sid, &orig_rc);
     if (!rc) {
-        rc = sidtab_context_to_sid(sidtab, &context, sid);
+#ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
+        rc = context_add_hash(policydb, &context);
+#endif
+        if (!rc)
+            rc = sidtab_context_to_sid(sidtab, &context, sid);
         // rc should not be frozen
         context_destroy(&context);
         // removed: if (rc == -ESTALE)
         if (!orig_rc) {
-            // sync to global sidtab
-            orig_rc = sidtab_context_to_sid(orig_sidtab, &orig_context, &orig_sid);
-            if (orig_sid_p)
-                *orig_sid_p = orig_sid;
+#ifdef KSU_COMPAT_HAS_CONTEXT_ADD_HASH
+            orig_rc = context_add_hash(orig_policydb, &orig_context);
+#endif
+            if (!orig_rc) {
+                // sync to global sidtab
+                orig_rc = sidtab_context_to_sid(orig_sidtab, &orig_context, &orig_sid);
+                if (orig_sid_p)
+                    *orig_sid_p = orig_sid;
+            }
             context_destroy(&orig_context);
         }
     }

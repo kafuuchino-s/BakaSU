@@ -4,6 +4,7 @@
 #include <linux/kprobes.h>
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
+#include <linux/atomic.h>
 #include <linux/version.h>
 #ifdef CONFIG_KSU_SUSFS
 #include <linux/susfs_def.h>
@@ -17,6 +18,10 @@
 #include "policy/feature.h"
 #include "klog.h" // IWYU pragma: keep
 #include "runtime/ksud.h"
+#include "runtime/ksud_boot.h"
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs.h>
+#endif
 #include "feature/kernel_umount.h"
 #include "compat/kernel_compat.h"
 #include "manager/manager_identity.h"
@@ -138,7 +143,7 @@ static int do_get_info_legacy(void __user *arg)
 
 static int do_report_event(void __user *arg)
 {
-    static bool services_started = false;
+    static atomic_t services_started = ATOMIC_INIT(0);
     struct ksu_report_event_cmd cmd;
 
     if (copy_from_user(&cmd, arg, sizeof(cmd))) {
@@ -147,12 +152,11 @@ static int do_report_event(void __user *arg)
 
     switch (cmd.event) {
     case EVENT_POST_FS_DATA: {
-        static bool post_fs_data_lock = false;
+        static atomic_t post_fs_data_lock = ATOMIC_INIT(0);
 
         // Reset for emulated soft reboot
-        services_started = false;
-        if (!post_fs_data_lock) {
-            post_fs_data_lock = true;
+        atomic_set(&services_started, 0);
+        if (!atomic_xchg(&post_fs_data_lock, 1)) {
             if (ksu_late_loaded) {
                 pr_info("post-fs-data skipped (late load)\n");
             } else {
@@ -163,19 +167,20 @@ static int do_report_event(void __user *arg)
         break;
     }
     case EVENT_BOOT_COMPLETED: {
-        static bool boot_complete_lock = false;
-        if (!boot_complete_lock) {
-            boot_complete_lock = true;
+        static atomic_t boot_complete_lock = ATOMIC_INIT(0);
+        if (!atomic_xchg(&boot_complete_lock, 1)) {
             if (ksu_late_loaded) {
                 pr_info("boot_complete skipped (late load)\n");
             } else {
                 pr_info("boot_complete triggered\n");
                 on_boot_completed();
-#ifdef CONFIG_KSU_SUSFS
-                susfs_start_sdcard_monitor_fn();
-#endif
             }
         }
+#ifdef CONFIG_KSU_SUSFS
+        /* Boot handler runs once; a later privileged event may retry setup. */
+        if (!ksu_late_loaded)
+            susfs_start_sdcard_monitor_fn();
+#endif
         break;
     }
     case EVENT_MODULE_MOUNTED: {
@@ -184,11 +189,10 @@ static int do_report_event(void __user *arg)
         break;
     }
     case EVENT_SERVICES: {
-        if (services_started) {
+        if (atomic_xchg(&services_started, 1)) {
             pr_info("services already started, skipping\n");
             return 0;
         }
-        services_started = true;
         pr_info("services triggered\n");
         return 1;
     }
@@ -1085,7 +1089,7 @@ int ksu_handle_susfs_cmd(unsigned int cmd, void __user **arg)
         return 0;
     }
     }
-    return 0;
+    return -EOPNOTSUPP;
 }
 #endif
 

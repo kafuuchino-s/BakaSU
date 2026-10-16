@@ -297,8 +297,9 @@ ccflags-y += -DKSU_COMPAT_HAS_UAPI_MODULE_H
 endif
 
 # optional hook
-ifneq ($(shell grep -q "ksu_handle_post_execve" $(srctree)/fs/exec.c; echo $$?),0)
+ifneq ($(filter y,$(CONFIG_KSU_MANUAL_HOOK) $(CONFIG_KSU_SUSFS)),)
 $(info -- $(REPO_NAME)/compat: ksu_handle_post_execve hook not found)
+else
 ccflags-y += -DKSU_COMPAT_NO_POST_EXECVE_HOOK
 endif
 
@@ -330,4 +331,11 @@ endif
 ifeq ($(shell grep -q -F "rc = mls_context_to_sid(pol, oldc, p, ctx, sidtabp, def_sid);" $(srctree)/security/selinux/ss/services.c 2>/dev/null; echo $$?),0)
 $(info -- $(REPO_NAME)/compat: stricter mls_context_to_sid found)
 ccflags-y += -DKSU_COMPAT_HAS_STRICTER_MLS_CONTEXT_TO_SID
+endif
+
+# Google's backport
+# https://android-review.googlesource.com/q/Iead2a1d90731ae24fefec2a40af5ffdc457ac916
+ifeq ($(shell grep -q "^int context_add_hash" $(srctree)/security/selinux/ss/services.c 2>/dev/null; echo $$?),0)
+$(info -- $(REPO_NAME)/compat: found hash indexed sidtab)
+ccflags-y += -DKSU_COMPAT_HAS_CONTEXT_ADD_HASH
 endif

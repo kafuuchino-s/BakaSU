@@ -1,3 +1,4 @@
+#include <linux/odin_ksu_hooks.h>
 #include "feature/selinux_hide.h"
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
@@ -679,10 +680,14 @@ void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_pt
 
 #endif
 
-#ifdef CONFIG_KSU_SUSFS
+#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_MANUAL_HOOK)
 void ksu_handle_vfs_fstat(int fd, loff_t *kstat_size_ptr)
 {
-    struct file *file = fget(fd);
+    struct file *file;
+
+    if (ksu_init_rc_hook_inactive() || !is_init(current_cred()))
+        return;
+    file = fget(fd);
 
     if (!file)
         return;
@@ -767,15 +772,10 @@ static void ksu_handle_sys_read_fd(unsigned int fd)
 }
 #endif
 
-int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
+void ksu_handle_sys_read(unsigned int fd)
 {
-#ifdef CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
-    return 0; // dummy hook here
-#else
-
+#ifndef CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK
     ksu_handle_sys_read_fd(fd);
-
-    return 0;
 #endif
 }
 
@@ -998,7 +998,7 @@ static long ksu_sys_read(const struct pt_regs *regs)
     char __user **buf_ptr = (char __user **)&PT_REGS_PARM2(regs);
     size_t *count_ptr = (size_t *)&PT_REGS_PARM3(regs);
 
-    ksu_handle_sys_read(fd, buf_ptr, count_ptr);
+    ksu_handle_sys_read(fd);
     return orig_sys_read(regs);
 }
 

@@ -1,6 +1,9 @@
 #ifndef __KSU_H_THRONE_TRACKER
 #define __KSU_H_THRONE_TRACKER
 
+struct dentry;
+void ksu_handle_rename(struct dentry *old_dentry, struct dentry *new_dentry);
+
 #define TRACK_THRONE_PRUNE_ONLY (1 << 0)
 #define TRACK_THRONE_FROM_RENAMEAT (1 << 1)
 #define TRACK_THRONE_FORCE_SYNCHRONOUS (1 << 2)
