@@ -10,6 +10,14 @@ void ksu_selinux_hide_drop_backup_if_unused();
 void ksu_selinux_hide_handle_second_stage();
 void ksu_selinux_hide_handle_post_fs_data();
 
+struct policydb;
+struct page;
+struct policydb *ksu_selinux_hide_policydb(struct policydb *policydb);
+struct page *ksu_selinux_hide_status_page(void);
+
+/* Synchronous process-context hook; data stays owned by the load caller. */
+void ksu_selinux_hide_policy_load_after(const void *data, size_t len, int rc);
+
 // https://github.com/torvalds/linux/commit/b21507e272627c434e8dd74e8d51fd8245281b59
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0) || defined(KSU_COMPAT_SETPROCATTR_USE_NEW_PROTOTYPE)
 typedef int (*setprocattr_fn)(const char *name, void *value, size_t size);
