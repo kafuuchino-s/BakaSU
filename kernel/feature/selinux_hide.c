@@ -46,6 +46,15 @@
 #include "selinux_hide.h"
 #include "compat/kernel_compat.h"
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0) && \
+    defined(KSU_COMPAT_USE_SELINUX_STATE) && !defined(KSU_COMPAT_HAS_POLICY_MUTEX) && \
+    !defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT) && !defined(MODULE)
+#define KSU_SELINUX_MAF_COMPAT
+#include <linux/spinlock.h>
+#include <linux/slab.h>
+#include <linux/vmalloc.h>
+#endif
+
 #ifdef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE
 #define __maybe_static
 
@@ -61,6 +70,7 @@ __maybe_static bool ksu_selinux_hide_enabled __read_mostly = false;
 // remove static in susfs
 __maybe_static bool ksu_selinux_hide_running __read_mostly = false;
 
+#ifndef KSU_SELINUX_MAF_COMPAT
 #ifdef KSU_COMPAT_USE_STATIC_KEY
 // We should talk to you, susfs
 // Why use manual hook instead of auto hook
@@ -68,9 +78,10 @@ __maybe_static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);
 #else
 static bool fake_status_initialize_key __read_mostly = false;
 #endif
+static struct mutex *ksu_selinux_status_lock = NULL;
+#endif
 
 __maybe_static struct page *fake_status = NULL;
-static struct mutex *ksu_selinux_status_lock = NULL;
 __maybe_static void initialize_fake_status();
 
 #ifndef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE
@@ -220,6 +231,192 @@ static write_op_fn orig_context_write, orig_access_write;
 #define ksu_security_bounded_transition_compat(...) security_bounded_transition(&selinux_state, __VA_ARGS__)
 #endif
 
+#ifdef KSU_SELINUX_MAF_COMPAT
+/* selinux_MAF_fork: eight task-bound, nestable clean-eval scopes. */
+static struct {
+    struct task_struct *task;
+    unsigned int depth;
+} ksu_maf_clean_scopes[8];
+static DEFINE_RAW_SPINLOCK(ksu_maf_scope_lock);
+
+/* The first successful load owns this immutable P0 for the whole boot. */
+static DEFINE_MUTEX(ksu_maf_capture_lock);
+static void *ksu_maf_policy_blob;
+static struct policydb *ksu_maf_policydb;
+
+static bool ksu_maf_enter_clean_eval(void)
+{
+    struct task_struct *task = current;
+    unsigned long flags;
+    int i, empty = -1;
+    bool entered = false;
+
+    if (ksu_get_uid_t(current_uid()) < 10000 || !smp_load_acquire(&ksu_maf_policydb))
+        return false;
+    raw_spin_lock_irqsave(&ksu_maf_scope_lock, flags);
+    for (i = 0; i < ARRAY_SIZE(ksu_maf_clean_scopes); i++) {
+        if (ksu_maf_clean_scopes[i].task == task) {
+            ksu_maf_clean_scopes[i].depth++;
+            entered = true;
+            break;
+        }
+        if (empty < 0 && !ksu_maf_clean_scopes[i].task)
+            empty = i;
+    }
+    if (!entered && empty >= 0) {
+        ksu_maf_clean_scopes[empty].task = task;
+        ksu_maf_clean_scopes[empty].depth = 1;
+        entered = true;
+    }
+    raw_spin_unlock_irqrestore(&ksu_maf_scope_lock, flags);
+    return entered;
+}
+
+static void ksu_maf_leave_clean_eval(void)
+{
+    unsigned long flags;
+    int i;
+
+    raw_spin_lock_irqsave(&ksu_maf_scope_lock, flags);
+    for (i = 0; i < ARRAY_SIZE(ksu_maf_clean_scopes); i++) {
+        if (ksu_maf_clean_scopes[i].task != current)
+            continue;
+        if (!--ksu_maf_clean_scopes[i].depth)
+            ksu_maf_clean_scopes[i].task = NULL;
+        break;
+    }
+    raw_spin_unlock_irqrestore(&ksu_maf_scope_lock, flags);
+}
+
+static ssize_t patch_response_seqno(char *buf, ssize_t ret, u32 new_seqno)
+{
+    char *p = buf;
+    char *end = buf + ret;
+    char *tok_start;
+    char new_str[12];
+    int ns_len;
+    int tok;
+    ssize_t diff;
+
+    if (ret <= 0 || !buf)
+        return ret;
+
+    /* Skip 4 space-separated tokens to reach the 5th (seqno) */
+    for (tok = 0; tok < 4; tok++) {
+        while (p < end && *p == ' ') p++;
+        while (p < end && *p != ' ') p++;
+    }
+    while (p < end && *p == ' ') p++;
+    tok_start = p;
+    while (p < end && *p != ' ' && *p != '\0' && *p != '\n') p++;
+
+    if (tok_start >= p)
+        return ret;
+
+    /* Render new_seqno as decimal */
+    {
+        u32 v = new_seqno;
+        int i = 0;
+        char tmp[12];
+        if (v == 0) {
+            new_str[0] = '0';
+            ns_len = 1;
+        } else {
+            while (v > 0) { tmp[i++] = '0' + (v % 10); v /= 10; }
+            for (ns_len = 0; ns_len < i; ns_len++)
+                new_str[ns_len] = tmp[i - 1 - ns_len];
+        }
+    }
+
+    diff = (ssize_t)ns_len - (ssize_t)(p - tok_start);
+    if (diff != 0) {
+        /* Shift the remainder of the string left or right */
+        char *dst = tok_start + ns_len;
+        char *src = p;
+        size_t move = (size_t)(end - src);
+        int j;
+        if (diff < 0) {
+            for (j = 0; j < (int)move; j++) dst[j] = src[j];
+        } else {
+            for (j = (int)move - 1; j >= 0; j--) dst[j] = src[j];
+        }
+        ret += diff;
+    }
+
+    {
+        int k;
+        for (k = 0; k < ns_len; k++)
+            tok_start[k] = new_str[k];
+    }
+    return ret;
+}
+#endif
+
+/* These typed callbacks are called directly at the original helper entries. */
+struct policydb *ksu_selinux_hide_policydb(struct policydb *policydb)
+{
+#ifdef KSU_SELINUX_MAF_COMPAT
+    struct policydb *clean = smp_load_acquire(&ksu_maf_policydb);
+    unsigned long flags;
+    int i;
+
+    if (ksu_get_uid_t(current_uid()) < 10000 || !clean)
+        return policydb;
+    raw_spin_lock_irqsave(&ksu_maf_scope_lock, flags);
+    for (i = 0; i < ARRAY_SIZE(ksu_maf_clean_scopes); i++) {
+        if (ksu_maf_clean_scopes[i].task == current && ksu_maf_clean_scopes[i].depth) {
+            policydb = clean;
+            break;
+        }
+    }
+    raw_spin_unlock_irqrestore(&ksu_maf_scope_lock, flags);
+#endif
+    return policydb;
+}
+
+struct page *ksu_selinux_hide_status_page(void)
+{
+#ifdef KSU_SELINUX_MAF_COMPAT
+    if (ksu_get_uid_t(current_uid()) >= 10000 && READ_ONCE(ksu_selinux_hide_enabled))
+        return smp_load_acquire(&fake_status);
+#endif
+    return NULL;
+}
+
+/* Process context: finish copying/parsing before the load caller frees data. */
+void ksu_selinux_hide_policy_load_after(const void *data, size_t len, int rc)
+{
+#ifdef KSU_SELINUX_MAF_COMPAT
+    struct policydb *policydb;
+    struct policy_file file;
+    void *copy;
+
+    if (rc || !data || !len)
+        return;
+    mutex_lock(&ksu_maf_capture_lock);
+    if (ksu_maf_policy_blob)
+        goto out;
+    copy = vmalloc(len);
+    if (!copy)
+        goto out;
+    memcpy(copy, data, len);
+    ksu_maf_policy_blob = copy;
+    policydb = kzalloc(sizeof(*policydb), GFP_KERNEL);
+    if (!policydb)
+        goto out;
+    file.data = copy;
+    file.len = len;
+    if (policydb_read(policydb, &file)) {
+        /* 5.4 policydb_read already destroys its partial object on error. */
+        kfree(policydb);
+        goto out;
+    }
+    smp_store_release(&ksu_maf_policydb, policydb);
+out:
+    mutex_unlock(&ksu_maf_capture_lock);
+#endif
+}
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
 #define ksu_task_security_struct task_security_struct
 #else
@@ -237,6 +434,14 @@ static inline u32 current_sid(void)
 
 static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 {
+#ifdef KSU_SELINUX_MAF_COMPAT
+    bool scoped = ksu_maf_enter_clean_eval();
+    ssize_t ret = orig_context_write(file, buf, size);
+
+    if (scoped)
+        ksu_maf_leave_clean_eval();
+    return ret;
+#else
     // apply to all app uids
     if (likely(ksu_get_uid_t(current_uid()) < 10000)) {
         return orig_context_write(file, buf, size);
@@ -297,10 +502,22 @@ static ssize_t my_write_context(struct file *file, char *buf, size_t size)
 out:
     kfree(canon);
     return length;
+#endif
 }
 
 static ssize_t my_write_access(struct file *file, char *buf, size_t size)
 {
+#ifdef KSU_SELINUX_MAF_COMPAT
+    bool scoped = ksu_maf_enter_clean_eval();
+    ssize_t ret = orig_access_write(file, buf, size);
+
+    if (scoped) {
+        ksu_maf_leave_clean_eval();
+        if (ret > 0)
+            ret = patch_response_seqno(buf, ret, 1);
+    }
+    return ret;
+#else
     // apply to all app uids
     if (likely(ksu_get_uid_t(current_uid()) < 10000)) {
         return orig_access_write(file, buf, size);
@@ -390,6 +607,7 @@ out:
     kfree(tcon);
     kfree(scon);
     return length;
+#endif
 }
 
 /*
@@ -449,6 +667,14 @@ int ksu_handle_selinux_setprocattr(const char *name, void *value, size_t size)
 int __nocfi ksu_handle_selinux_setprocattr(struct task_struct *p, char *name, void *value, size_t size)
 #endif
 {
+#ifdef KSU_SELINUX_MAF_COMPAT
+    bool scoped = name && !strcmp(name, "current") && ksu_maf_enter_clean_eval();
+    int ret = ksu_orig_setprocattr(name, value, size);
+
+    if (scoped)
+        ksu_maf_leave_clean_eval();
+    return ret;
+#else
     if (likely(ksu_get_uid_t(current_uid()) < 10000)) {
         goto call_orig;
     }
@@ -545,8 +771,10 @@ call_orig:
 #else
     return ksu_orig_setprocattr(p, name, value, size);
 #endif
+#endif
 }
 
+#ifndef KSU_SELINUX_MAF_COMPAT
 typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
 static sel_open_handle_status_fn orig_sel_open_handle_status, *sel_open_handle_status_slot;
 static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
@@ -602,6 +830,8 @@ static void hook_selinux_status_open()
     }
 }
 
+#endif /* !KSU_SELINUX_MAF_COMPAT: native status.open hook */
+
 extern void ksu_unregister_setprocattr_lsm_hook();
 
 static void ksu_selinux_hide_unhook()
@@ -610,14 +840,18 @@ static void ksu_selinux_hide_unhook()
     if (orig_context_write) {
         ret =
             ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
+#ifndef KSU_SELINUX_MAF_COMPAT
         orig_context_write = NULL;
+#endif
         if (ret) {
             pr_err("selinux_hide: exit: patch_text context_write err: %d\n", ret);
         }
     }
     if (orig_access_write) {
         ret = ksu_patch_text(access_write, &orig_access_write, sizeof(orig_access_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
+#ifndef KSU_SELINUX_MAF_COMPAT
         orig_access_write = NULL;
+#endif
         if (ret) {
             pr_err("selinux_hide: exit: patch_text access_write err: %d\n", ret);
         }
@@ -628,7 +862,9 @@ static void ksu_selinux_hide_unhook()
     if (ksu_orig_setprocattr) {
         ret = ksu_patch_text((void *)selinux_setprocattr_hook_ptr, &ksu_orig_setprocattr, sizeof(ksu_orig_setprocattr),
                              KSU_PATCH_TEXT_FLUSH_DCACHE);
+#ifndef KSU_SELINUX_MAF_COMPAT
         ksu_orig_setprocattr = NULL;
+#endif
         if (ret) {
             pr_err("selinux_hide: exit: patch_text setprocattr err: %d\n", ret);
         }
@@ -654,6 +890,7 @@ static int ksu_selinux_hide_enable()
 {
     int ret;
     pr_info("selinux_hide: init selinux hide\n");
+#ifndef KSU_SELINUX_MAF_COMPAT
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) || defined(KSU_COMPAT_HAS_SELINUX_POLICY_STRUCT)
     if (!backup_sepolicy) {
         pr_err("no backup sepolicy available, please save feature and reboot to retry!\n");
@@ -670,6 +907,7 @@ static int ksu_selinux_hide_enable()
         return -EAGAIN;
     }
 #endif
+#endif /* !KSU_SELINUX_MAF_COMPAT */
 
 #ifdef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE
 
@@ -679,8 +917,15 @@ static int ksu_selinux_hide_enable()
 #endif
 
 #else
+#ifdef KSU_SELINUX_MAF_COMPAT
+    initialize_fake_status();
+    if (!smp_load_acquire(&fake_status))
+        return -ENOMEM;
+#else
     hook_selinux_status_open();
+#endif
 
+#ifndef KSU_SELINUX_MAF_COMPAT
     // clang-format off
 #ifdef CONFIG_KALLSYMS_ALL
     #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0) || defined(KSU_COMPAT_USE_SELINUX_STATE)
@@ -757,6 +1002,7 @@ static int ksu_selinux_hide_enable()
     #endif
 #endif
     // clang-format on
+#endif
 
 #ifdef CONFIG_KALLSYMS_ALL
     selinux_write_op = (write_op_fn *)find_kernel_symbol_exact("write_op");
@@ -826,6 +1072,10 @@ static int ksu_selinux_hide_enable()
         goto out;
     }
 
+#ifdef KSU_SELINUX_MAF_COMPAT
+    ret = -ENOENT;
+    goto unhook;
+#endif
 #undef ksu_for_each_lsm_entry
 out:
 #else
@@ -842,7 +1092,11 @@ out:
 unhook:
 #endif
     ksu_selinux_hide_unhook();
+#ifdef KSU_SELINUX_MAF_COMPAT
+    return ret;
+#else
     return -ENOSYS;
+#endif
 }
 
 static void ksu_selinux_hide_disable()
@@ -891,6 +1145,7 @@ static const struct ksu_feature_handler selinux_hide_handler = {
 
 void ksu_selinux_hide_handle_second_stage()
 {
+#ifndef KSU_SELINUX_MAF_COMPAT
     initialize_fake_status();
     // https://github.com/torvalds/linux/blame/e8c2f9fdadee7cbc75134dc463c1e0d856d6e5c7/security/selinux/selinuxfs.c#L2014
     if (fake_status) {
@@ -902,10 +1157,12 @@ void ksu_selinux_hide_handle_second_stage()
     } else {
         pr_warn("selinux_hide: fake status need late initialization\n");
     }
+#endif
 }
 
 void ksu_selinux_hide_handle_post_fs_data()
 {
+#ifndef KSU_SELINUX_MAF_COMPAT
 #ifdef KSU_COMPAT_USE_STATIC_KEY
     static_key_disable(&fake_status_initialize_key.key);
 #else
@@ -914,6 +1171,7 @@ void ksu_selinux_hide_handle_post_fs_data()
     if (!fake_status) {
         pr_err("selinux_hide: fake status is not initialized after post-fs-data!\n");
     }
+#endif
 }
 
 void __init ksu_selinux_hide_init()
@@ -921,6 +1179,9 @@ void __init ksu_selinux_hide_init()
     if (ksu_register_feature_handler(&selinux_hide_handler)) {
         pr_err("Failed to register selinux_hide feature handler\n");
     }
+#ifdef KSU_SELINUX_MAF_COMPAT
+    initialize_fake_status();
+#else
     if (ksu_late_loaded) {
         initialize_fake_status();
     } else {
@@ -933,6 +1194,7 @@ void __init ksu_selinux_hide_init()
 #ifndef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE
     hook_selinux_status_open();
 #endif
+#endif /* !KSU_SELINUX_MAF_COMPAT */
 }
 
 void __exit ksu_selinux_hide_exit()
@@ -944,11 +1206,17 @@ void __exit ksu_selinux_hide_exit()
     }
     mutex_unlock(&selinux_hide_mutex);
     ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
+#ifdef KSU_SELINUX_MAF_COMPAT
+    /* Built-in only: retain the page for outstanding FDs/VMAs, and the first
+     * blob/policydb for any already-entered clean scope. No module unload.
+     */
+#else
     mutex_lock(ksu_selinux_status_lock);
     if (fake_status)
         __free_page(fake_status);
     fake_status = NULL;
     mutex_unlock(ksu_selinux_status_lock);
+#endif
 }
 
 void ksu_selinux_hide_drop_backup_if_unused()
@@ -988,6 +1256,24 @@ void ksu_selinux_hide_drop_backup_if_unused()
 // for susfs xN
 __maybe_static void initialize_fake_status()
 {
+#ifdef KSU_SELINUX_MAF_COMPAT
+    struct page *new_page;
+    struct selinux_kernel_status *status;
+
+    if (smp_load_acquire(&fake_status))
+        return;
+    new_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+    if (!new_page)
+        return;
+    status = page_address(new_page);
+    status->version = 1;
+    status->sequence = 0;
+    status->enforcing = 1;
+    status->policyload = 0;
+    status->deny_unknown = 1;
+    if (cmpxchg(&fake_status, NULL, new_page))
+        __free_page(new_page);
+#else
     // https://github.com/torvalds/linux/commit/4b36cb773a8153417a080f8025d522322f915aea
 #if LINUX_VERSION_CODE > KERNEL_VERSION(5, 7, 0) || defined(KSU_COMPAT_SELINUX_STATUS_VAR_IN_SELINUX_STATE)
     ksu_selinux_status_lock = &selinux_state.status_lock;
@@ -1028,10 +1314,12 @@ __maybe_static void initialize_fake_status()
     }
 
     struct selinux_kernel_status *status = page_address(selinux_status_page);
+#ifndef KSU_SELINUX_MAF_COMPAT
     if (!status->enforcing && !ksu_late_loaded) {
         pr_warn("initialize_fake_status: skip not enforcing\n");
         goto out;
     }
+#endif
 
     struct page *new_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
     if (!new_page) {
@@ -1041,6 +1329,13 @@ __maybe_static void initialize_fake_status()
 
     struct selinux_kernel_status *new_status = page_address(new_page);
     memcpy(new_status, status, sizeof(*status));
+#ifdef KSU_SELINUX_MAF_COMPAT
+    new_status->version = 1;
+    new_status->sequence = 0;
+    new_status->enforcing = 1;
+    new_status->policyload = 0;
+    new_status->deny_unknown = 1;
+#endif
     if (ksu_late_loaded) {
         // In late_load mode the loader may have reloaded sepolicy before us,
         // so the captured page is not stock. Serve what a stock boot ends
@@ -1064,6 +1359,7 @@ __maybe_static void initialize_fake_status()
 
 out:
     mutex_unlock(ksu_selinux_status_lock);
+#endif
 }
 
 #ifndef KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE
